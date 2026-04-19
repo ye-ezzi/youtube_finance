@@ -6,6 +6,9 @@ ANTHROPIC_API_KEY와 YOUTUBE_API_KEY 환경변수(또는 .env 파일)가 필요�
 import json
 import os
 import sys
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import urllib.request
@@ -185,6 +188,34 @@ def save_report(report, today_str):
     return report_path
 
 
+def send_email(report, today_str):
+    sender = load_env_key("EMAIL_FROM")
+    recipient = load_env_key("EMAIL_TO")
+    password = load_env_key("EMAIL_APP_PASSWORD")
+
+    if not all([sender, recipient, password]):
+        print("이메일 설정이 없어 발송을 건너뜁니다. (.env에 EMAIL_FROM, EMAIL_TO, EMAIL_APP_PASSWORD 추가)")
+        return
+
+    html_body = "<br>".join(
+        f"<b>{line}</b>" if line.startswith("#") else line
+        for line in report.replace("**", "").splitlines()
+    )
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"📊 재테크 트렌드 리포트 — {today_str}"
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(report, "plain", "utf-8"))
+    msg.attach(MIMEText(f"<pre style='font-family:sans-serif'>{html_body}</pre>", "html", "utf-8"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+    print(f"이메일 발송 완료 → {recipient}")
+
+
 def main():
     print("=" * 60)
     print("  재테크 YouTube 일일 트렌드 리포트")
@@ -221,6 +252,8 @@ def main():
 
     report_path = save_report(report, today_str)
     print(f"\n리포트 저장 완료: {report_path}")
+
+    send_email(report, today_str)
 
 
 if __name__ == "__main__":
