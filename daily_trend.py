@@ -19,6 +19,35 @@ import anthropic
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 LOOKBACK_HOURS = 48
+MODEL = "claude-opus-4-7"
+
+REPORT_FORMAT_PROMPT = """위 데이터를 바탕으로 오늘의 재테크 트렌드 리포트를 아래 형식으로 작성해주세요:
+
+📊 **오늘의 재테크 트렌드 리포트**
+
+1. 🔥 **핵심 트렌드** (오늘 가장 많이 다뤄진 주제 3~5가지)
+
+2. 💰 **주목받는 종목 / 자산**
+
+3. 📈 **시장 센티먼트** (전반적인 분위기: 강세/약세/혼조, 그 근거)
+
+4. 📺 **채널별 주요 내용** (각 채널이 오늘 집중한 내용 요약)
+
+5. 💡 **오늘의 핵심 인사이트** (오늘 꼭 알아야 할 2~3가지)
+
+6. ⚠️ **주의사항** (위험 요인 또는 엇갈리는 시각이 있다면)"""
+
+SYSTEM_PROMPT = """당신은 한국의 재테크 전문 분석가입니다.
+YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘의 투자 트렌드 리포트를 작성합니다.
+
+리포트 작성 원칙:
+- 여러 채널에서 공통적으로 다루는 주제를 핵심 트렌드로 파악합니다
+- 언급되는 종목, 자산 클래스, 섹터를 정리합니다
+- 전반적인 시장 센티먼트(긍정/부정/중립)를 파악합니다
+- 재테크 초보자도 이해할 수 있는 명확한 한국어로 작성합니다
+- 구체적인 영상 제목과 채널명을 인용하여 근거를 제시합니다
+- 과도한 투자 권유나 단정적 예측은 하지 않습니다
+- 상충되는 견해가 있다면 균형 있게 전달합니다"""
 
 
 def load_env_key(var_name):
@@ -35,8 +64,12 @@ def load_env_key(var_name):
 
 def youtube_get(endpoint, params):
     url = f"{YOUTUBE_API_BASE}/{endpoint}?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"YouTube API {e.code}: {body[:200]}") from e
 
 
 def fetch_channel_videos(channel_id, api_key, max_results=10):
@@ -81,12 +114,14 @@ def collect_all_videos(api_key, channels):
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
 
     all_data = []
+    errors = []
     for ch in channels:
         print(f"  수집 중: {ch['name']} ...", end=" ", flush=True)
         try:
             videos = fetch_channel_videos(ch["channel_id"], api_key)
-        except urllib.error.HTTPError as e:
-            print(f"오류 {e.code}")
+        except Exception as e:
+            errors.append(f"{ch['name']}: {e}")
+            print(f"오류 — {e}")
             continue
 
         recent = [
@@ -105,6 +140,11 @@ def collect_all_videos(api_key, channels):
             print(f"{len(recent)}개 동영상")
         else:
             print("동영상 없음")
+
+    if errors:
+        print(f"\n⚠️  {len(errors)}개 채널에서 오류 발생:")
+        for err in errors:
+            print(f"   - {err}")
 
     return all_data
 
@@ -129,48 +169,39 @@ def build_video_summary(all_data):
 def generate_trend_report(video_summary, today_str):
     client = anthropic.Anthropic()
 
-    system_prompt = """당신은 한국의 재테크 전문 분석가입니다.
-YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘의 투자 트렌드 리포트를 작성합니다.
-
-리포트 작성 원칙:
-- 여러 채널에서 공통적으로 다루는 주제를 핵심 트렌드로 파악합니다
-- 언급되는 종목, 자산 클래스, 섹터를 정리합니다
-- 전반적인 시장 센티먼트(긍정/부정/중립)를 파악합니다
-- 재테크 초보자도 이해할 수 있는 명확한 한국어로 작성합니다
-- 구체적인 영상 제목과 채널명을 인용하여 근거를 제시합니다
-- 과도한 투자 권유나 단정적 예측은 하지 않습니다"""
-
-    user_message = f"""오늘 날짜: {today_str}
-
-다음은 최근 48시간 내 수집된 재테크 YouTube 채널들의 최신 동영상입니다:
-
-{video_summary}
-
-위 데이터를 바탕으로 오늘의 재테크 트렌드 리포트를 아래 형식으로 작성해주세요:
-
-📊 **오늘의 재테크 트렌드 리포트** ({today_str})
-
-1. 🔥 **핵심 트렌드** (오늘 가장 많이 다뤄진 주제 3~5가지)
-
-2. 💰 **주목받는 종목 / 자산**
-
-3. 📈 **시장 센티먼트** (전반적인 분위기: 강세/약세/혼조)
-
-4. 📺 **채널별 주요 내용** (각 채널이 오늘 집중한 내용)
-
-5. 💡 **오늘의 핵심 인사이트** (오늘 꼭 알아야 할 2~3가지)"""
+    # 캐시: 시스템 프롬프트 (변하지 않음)
+    # 캐시: 리포트 형식 지시문 (변하지 않음)
+    # 비캐시: 실제 영상 데이터 (매일 변함)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"오늘 날짜: {today_str}\n\n다음은 최근 {LOOKBACK_HOURS}시간 내 수집된 재테크 YouTube 채널들의 최신 동영상입니다:\n\n{video_summary}\n\n",
+                },
+                {
+                    "type": "text",
+                    "text": REPORT_FORMAT_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        }
+    ]
 
     report_parts = []
     with client.messages.stream(
-        model="claude-opus-4-7",
+        model=MODEL,
         max_tokens=4096,
-        thinking={"type": "adaptive"},
-        system=[{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=[{"role": "user", "content": user_message}],
+        thinking={"type": "enabled", "budget_tokens": 2000},
+        system=[
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=messages,
     ) as stream:
         for text in stream.text_stream:
             print(text, end="", flush=True)
@@ -184,7 +215,10 @@ def save_report(report, today_str):
     reports_dir.mkdir(exist_ok=True)
     date_slug = datetime.now().strftime("%Y%m%d")
     report_path = reports_dir / f"trend_{date_slug}.md"
-    report_path.write_text(f"# 재테크 트렌드 리포트 — {today_str}\n\n{report}\n", encoding="utf-8")
+    report_path.write_text(
+        f"# 재테크 트렌드 리포트 — {today_str}\n\n{report}\n",
+        encoding="utf-8",
+    )
     return report_path
 
 
@@ -197,23 +231,37 @@ def send_email(report, today_str):
         print("이메일 설정이 없어 발송을 건너뜁니다. (.env에 EMAIL_FROM, EMAIL_TO, EMAIL_APP_PASSWORD 추가)")
         return
 
-    html_body = "<br>".join(
-        f"<b>{line}</b>" if line.startswith("#") else line
-        for line in report.replace("**", "").splitlines()
-    )
+    # 마크다운을 간단한 HTML로 변환
+    html_lines = []
+    for line in report.splitlines():
+        escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if escaped.startswith("#"):
+            html_lines.append(f"<h3>{escaped.lstrip('#').strip()}</h3>")
+        elif escaped.startswith("- ") or escaped.startswith("* "):
+            html_lines.append(f"<li>{escaped[2:]}</li>")
+        elif escaped.strip() == "":
+            html_lines.append("<br>")
+        else:
+            import re
+            escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+            html_lines.append(f"<p>{escaped}</p>")
+    html_body = "<html><body style='font-family:sans-serif;max-width:700px;margin:0 auto'>" + "\n".join(html_lines) + "</body></html>"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📊 재테크 트렌드 리포트 — {today_str}"
     msg["From"] = sender
     msg["To"] = recipient
     msg.attach(MIMEText(report, "plain", "utf-8"))
-    msg.attach(MIMEText(f"<pre style='font-family:sans-serif'>{html_body}</pre>", "html", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(sender, password)
-        server.sendmail(sender, recipient, msg.as_string())
-    print(f"이메일 발송 완료 → {recipient}")
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, recipient, msg.as_string())
+        print(f"이메일 발송 완료 → {recipient}")
+    except Exception as e:
+        print(f"⚠️  이메일 발송 실패: {e}")
 
 
 def main():
@@ -226,32 +274,35 @@ def main():
 
     youtube_key = load_env_key("YOUTUBE_API_KEY")
     if not youtube_key:
-        sys.exit("YOUTUBE_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
+        sys.exit("❌ YOUTUBE_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
 
     anthropic_key = load_env_key("ANTHROPIC_API_KEY")
     if not anthropic_key:
-        sys.exit("ANTHROPIC_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
+        sys.exit("❌ ANTHROPIC_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
     os.environ["ANTHROPIC_API_KEY"] = anthropic_key
 
     channels_file = Path(__file__).parent / "channels.json"
+    if not channels_file.exists():
+        sys.exit(f"❌ channels.json 파일을 찾을 수 없습니다: {channels_file}")
     channels = json.loads(channels_file.read_text())
 
-    print("YouTube 채널에서 최신 동영상 수집 중...")
+    print(f"YouTube 채널 {len(channels)}개에서 최신 동영상 수집 중...")
     all_data = collect_all_videos(youtube_key, channels)
 
     if not all_data:
-        sys.exit("수집된 동영상이 없습니다. YouTube API 키와 채널 목록을 확인해주세요.")
+        sys.exit("❌ 수집된 동영상이 없습니다. YouTube API 키와 채널 목록을 확인해주세요.")
 
     total = sum(len(ch["videos"]) for ch in all_data)
     print(f"\n총 {len(all_data)}개 채널, {total}개 동영상 수집 완료\n")
 
     print("=" * 60)
+    print("  트렌드 분석 중 (Claude AI)...\n")
     video_summary = build_video_summary(all_data)
     report = generate_trend_report(video_summary, today_str)
     print("\n" + "=" * 60)
 
     report_path = save_report(report, today_str)
-    print(f"\n리포트 저장 완료: {report_path}")
+    print(f"\n✅ 리포트 저장 완료: {report_path}")
 
     send_email(report, today_str)
 
