@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 재테크 YouTube 채널의 최신 동영상을 분석하여 오늘의 트렌드 리포트를 생성합니다.
-ANTHROPIC_API_KEY와 YOUTUBE_API_KEY 환경변수(또는 .env 파일)가 필요합니다.
+ANTHROPIC_API_KEY는 필수입니다. YOUTUBE_API_KEY가 없으면 웹 검색 모드로 동작합니다.
 """
 import json
 import os
@@ -126,23 +126,77 @@ def build_video_summary(all_data):
     return "\n".join(lines)
 
 
-def generate_trend_report(video_summary, today_str):
+# ---------------------------------------------------------------------------
+# 웹 검색 기반 폴백 (YouTube API 키 없을 때)
+# ---------------------------------------------------------------------------
+
+def web_search(query):
+    """DuckDuckGo HTML 검색으로 상위 결과 제목+URL 반환"""
+    params = urllib.parse.urlencode({"q": query, "kl": "kr-kr"})
+    url = f"https://html.duckduckgo.com/html/?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    results = []
+    import re
+    for m in re.finditer(r'class="result__title"[^>]*>.*?href="([^"]+)"[^>]*>([^<]+)<', html, re.S):
+        url_found, title = m.group(1), m.group(2).strip()
+        results.append({"title": title, "url": url_found})
+        if len(results) >= 5:
+            break
+    return results
+
+
+def collect_web_market_data(channels):
+    """YouTube API 없이 채널명 기반 웹 검색 + 시장 키워드 수집"""
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+    queries = [
+        f"코스피 코스닥 오늘 시황 {today}",
+        f"원달러 환율 금리 오늘 {today}",
+        f"재테크 ETF 주식 트렌드 {today}",
+    ]
+    for ch in channels:
+        queries.append(f"{ch['name']} 최신 영상 재테크")
+
+    results_text = []
+    for q in queries:
+        hits = web_search(q)
+        if hits:
+            results_text.append(f"[검색: {q}]")
+            for h in hits:
+                results_text.append(f"  - {h['title']}  ({h['url']})")
+
+    return "\n".join(results_text) if results_text else "웹 검색 결과 없음"
+
+
+# ---------------------------------------------------------------------------
+# Claude 리포트 생성
+# ---------------------------------------------------------------------------
+
+def generate_trend_report(video_summary, today_str, mode="youtube"):
     client = anthropic.Anthropic()
 
     system_prompt = """당신은 한국의 재테크 전문 분석가입니다.
-YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘의 투자 트렌드 리포트를 작성합니다.
+수집된 재테크 관련 데이터를 분석하여 오늘의 투자 트렌드 리포트를 작성합니다.
 
 리포트 작성 원칙:
-- 여러 채널에서 공통적으로 다루는 주제를 핵심 트렌드로 파악합니다
+- 여러 채널/소스에서 공통적으로 다루는 주제를 핵심 트렌드로 파악합니다
 - 언급되는 종목, 자산 클래스, 섹터를 정리합니다
 - 전반적인 시장 센티먼트(긍정/부정/중립)를 파악합니다
 - 재테크 초보자도 이해할 수 있는 명확한 한국어로 작성합니다
-- 구체적인 영상 제목과 채널명을 인용하여 근거를 제시합니다
+- 구체적인 수치와 출처를 인용하여 근거를 제시합니다
 - 과도한 투자 권유나 단정적 예측은 하지 않습니다"""
 
-    user_message = f"""오늘 날짜: {today_str}
+    source_label = "YouTube 채널 동영상" if mode == "youtube" else "웹 검색 결과 (YouTube API 미사용)"
 
-다음은 최근 48시간 내 수집된 재테크 YouTube 채널들의 최신 동영상입니다:
+    user_message = f"""오늘 날짜: {today_str}
+데이터 수집 방식: {source_label}
+
+수집된 재테크 관련 데이터:
 
 {video_summary}
 
@@ -224,10 +278,6 @@ def main():
     today_str = datetime.now().strftime("%Y년 %m월 %d일")
     print(f"  날짜: {today_str}\n")
 
-    youtube_key = load_env_key("YOUTUBE_API_KEY")
-    if not youtube_key:
-        sys.exit("YOUTUBE_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
-
     anthropic_key = load_env_key("ANTHROPIC_API_KEY")
     if not anthropic_key:
         sys.exit("ANTHROPIC_API_KEY가 없습니다. .env 파일 또는 환경변수를 설정해주세요.")
@@ -236,18 +286,29 @@ def main():
     channels_file = Path(__file__).parent / "channels.json"
     channels = json.loads(channels_file.read_text())
 
-    print("YouTube 채널에서 최신 동영상 수집 중...")
-    all_data = collect_all_videos(youtube_key, channels)
+    youtube_key = load_env_key("YOUTUBE_API_KEY")
 
-    if not all_data:
-        sys.exit("수집된 동영상이 없습니다. YouTube API 키와 채널 목록을 확인해주세요.")
+    if youtube_key:
+        print("YouTube API 키 확인됨 — 채널 동영상 수집 모드")
+        print("YouTube 채널에서 최신 동영상 수집 중...")
+        all_data = collect_all_videos(youtube_key, channels)
 
-    total = sum(len(ch["videos"]) for ch in all_data)
-    print(f"\n총 {len(all_data)}개 채널, {total}개 동영상 수집 완료\n")
+        if not all_data:
+            sys.exit("수집된 동영상이 없습니다. YouTube API 키와 채널 목록을 확인해주세요.")
+
+        total = sum(len(ch["videos"]) for ch in all_data)
+        print(f"\n총 {len(all_data)}개 채널, {total}개 동영상 수집 완료\n")
+
+        video_summary = build_video_summary(all_data)
+        mode = "youtube"
+    else:
+        print("YouTube API 키 없음 — 웹 검색 폴백 모드로 전환")
+        print("시장 데이터 및 채널 키워드 수집 중...\n")
+        video_summary = collect_web_market_data(channels)
+        mode = "web"
 
     print("=" * 60)
-    video_summary = build_video_summary(all_data)
-    report = generate_trend_report(video_summary, today_str)
+    report = generate_trend_report(video_summary, today_str, mode)
     print("\n" + "=" * 60)
 
     report_path = save_report(report, today_str)
