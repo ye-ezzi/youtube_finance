@@ -197,6 +197,8 @@ def send_email(report, today_str):
         print("이메일 설정이 없어 발송을 건너뜁니다. (.env에 EMAIL_FROM, EMAIL_TO, EMAIL_APP_PASSWORD 추가)")
         return
 
+    password = password.encode("ascii", errors="ignore").decode("ascii").strip()
+
     html_body = "<br>".join(
         f"<b>{line}</b>" if line.startswith("#") else line
         for line in report.replace("**", "").splitlines()
