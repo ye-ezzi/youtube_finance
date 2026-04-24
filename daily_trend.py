@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import smtplib
+import time
+import argparse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
@@ -19,6 +21,7 @@ import anthropic
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 LOOKBACK_HOURS = 48
+MAX_RETRIES = 3
 
 
 def load_env_key(var_name):
@@ -33,10 +36,24 @@ def load_env_key(var_name):
     return key
 
 
-def youtube_get(endpoint, params):
+def youtube_get(endpoint, params, retries=MAX_RETRIES):
     url = f"{YOUTUBE_API_BASE}/{endpoint}?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url) as resp:
-        return json.loads(resp.read())
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 400):
+                raise
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 def fetch_channel_videos(channel_id, api_key, max_results=10):
@@ -76,9 +93,9 @@ def fetch_channel_videos(channel_id, api_key, max_results=10):
     return videos
 
 
-def collect_all_videos(api_key, channels):
+def collect_all_videos(api_key, channels, lookback_hours=LOOKBACK_HOURS):
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=LOOKBACK_HOURS)
+    cutoff = now - timedelta(hours=lookback_hours)
 
     all_data = []
     for ch in channels:
@@ -87,6 +104,9 @@ def collect_all_videos(api_key, channels):
             videos = fetch_channel_videos(ch["channel_id"], api_key)
         except urllib.error.HTTPError as e:
             print(f"오류 {e.code}")
+            continue
+        except Exception as e:
+            print(f"오류: {e}")
             continue
 
         recent = [
@@ -126,10 +146,7 @@ def build_video_summary(all_data):
     return "\n".join(lines)
 
 
-def generate_trend_report(video_summary, today_str):
-    client = anthropic.Anthropic()
-
-    system_prompt = """당신은 한국의 재테크 전문 분석가입니다.
+SYSTEM_PROMPT = """당신은 한국의 재테크 전문 분석가입니다.
 YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘의 투자 트렌드 리포트를 작성합니다.
 
 리포트 작성 원칙:
@@ -138,7 +155,12 @@ YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘
 - 전반적인 시장 센티먼트(긍정/부정/중립)를 파악합니다
 - 재테크 초보자도 이해할 수 있는 명확한 한국어로 작성합니다
 - 구체적인 영상 제목과 채널명을 인용하여 근거를 제시합니다
-- 과도한 투자 권유나 단정적 예측은 하지 않습니다"""
+- 과도한 투자 권유나 단정적 예측은 하지 않습니다
+- 각 섹션을 충분히 상세하게 작성하여 독자가 시장 상황을 한눈에 파악할 수 있도록 합니다"""
+
+
+def generate_trend_report(video_summary, today_str):
+    client = anthropic.Anthropic()
 
     user_message = f"""오늘 날짜: {today_str}
 
@@ -152,13 +174,15 @@ YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘
 
 1. 🔥 **핵심 트렌드** (오늘 가장 많이 다뤄진 주제 3~5가지)
 
-2. 💰 **주목받는 종목 / 자산**
+2. 💰 **주목받는 종목 / 자산** (주식, 부동산, 코인, ETF 등 언급 자산 정리)
 
-3. 📈 **시장 센티먼트** (전반적인 분위기: 강세/약세/혼조)
+3. 📈 **시장 센티먼트** (전반적인 분위기: 강세/약세/혼조, 그 이유)
 
-4. 📺 **채널별 주요 내용** (각 채널이 오늘 집중한 내용)
+4. 📺 **채널별 주요 내용** (각 채널이 오늘 집중한 내용 한 줄 요약)
 
-5. 💡 **오늘의 핵심 인사이트** (오늘 꼭 알아야 할 2~3가지)"""
+5. ⚠️ **주요 리스크 / 주의사항** (오늘 언급된 위험 요인)
+
+6. 💡 **오늘의 핵심 인사이트** (오늘 꼭 알아야 할 2~3가지 요약)"""
 
     report_parts = []
     with client.messages.stream(
@@ -167,7 +191,7 @@ YouTube 재테크 채널들의 최신 동영상 데이터를 분석하여 오늘
         thinking={"type": "adaptive"},
         system=[{
             "type": "text",
-            "text": system_prompt,
+            "text": SYSTEM_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
         messages=[{"role": "user", "content": user_message}],
@@ -188,6 +212,18 @@ def save_report(report, today_str):
     return report_path
 
 
+def save_raw_data(all_data):
+    data_dir = Path(__file__).parent / "data"
+    data_dir.mkdir(exist_ok=True)
+    date_slug = datetime.now().strftime("%Y%m%d")
+    raw_path = data_dir / f"raw_{date_slug}.json"
+    raw_path.write_text(json.dumps({
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "channels": all_data,
+    }, ensure_ascii=False, indent=2))
+    return raw_path
+
+
 def send_email(report, today_str):
     sender = load_env_key("EMAIL_FROM")
     recipient = load_env_key("EMAIL_TO")
@@ -197,26 +233,41 @@ def send_email(report, today_str):
         print("이메일 설정이 없어 발송을 건너뜁니다. (.env에 EMAIL_FROM, EMAIL_TO, EMAIL_APP_PASSWORD 추가)")
         return
 
-    html_body = "<br>".join(
-        f"<b>{line}</b>" if line.startswith("#") else line
-        for line in report.replace("**", "").splitlines()
-    )
+    html_lines = []
+    for line in report.splitlines():
+        clean = line.replace("**", "")
+        if line.startswith("#"):
+            html_lines.append(f"<h3>{clean}</h3>")
+        elif line.startswith("-"):
+            html_lines.append(f"<li>{clean[1:].strip()}</li>")
+        elif line.strip():
+            html_lines.append(f"<p>{clean}</p>")
+    html_body = "\n".join(html_lines)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📊 재테크 트렌드 리포트 — {today_str}"
     msg["From"] = sender
     msg["To"] = recipient
     msg.attach(MIMEText(report, "plain", "utf-8"))
-    msg.attach(MIMEText(f"<pre style='font-family:sans-serif'>{html_body}</pre>", "html", "utf-8"))
+    msg.attach(MIMEText(f"<html><body style='font-family:sans-serif;max-width:800px;margin:auto'>{html_body}</body></html>", "html", "utf-8"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(sender, password)
-        server.sendmail(sender, recipient, msg.as_string())
-    print(f"이메일 발송 완료 → {recipient}")
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, recipient, msg.as_string())
+        print(f"이메일 발송 완료 → {recipient}")
+    except Exception as e:
+        print(f"이메일 발송 실패: {e}")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="재테크 YouTube 일일 트렌드 리포트 생성")
+    parser.add_argument("--no-email", action="store_true", help="이메일 발송 건너뜀")
+    parser.add_argument("--lookback", type=int, default=LOOKBACK_HOURS, help=f"수집 기간 (시간, 기본값: {LOOKBACK_HOURS})")
+    parser.add_argument("--channels", help="특정 채널만 분석 (채널명, 쉼표로 구분)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  재테크 YouTube 일일 트렌드 리포트")
     print("=" * 60)
@@ -236,14 +287,23 @@ def main():
     channels_file = Path(__file__).parent / "channels.json"
     channels = json.loads(channels_file.read_text())
 
-    print("YouTube 채널에서 최신 동영상 수집 중...")
-    all_data = collect_all_videos(youtube_key, channels)
+    if args.channels:
+        names = {n.strip() for n in args.channels.split(",")}
+        channels = [c for c in channels if c["name"] in names]
+        if not channels:
+            sys.exit(f"지정한 채널을 찾을 수 없습니다: {args.channels}")
+
+    print(f"YouTube 채널에서 최신 동영상 수집 중... (최근 {args.lookback}시간)")
+    all_data = collect_all_videos(youtube_key, channels, lookback_hours=args.lookback)
 
     if not all_data:
         sys.exit("수집된 동영상이 없습니다. YouTube API 키와 채널 목록을 확인해주세요.")
 
     total = sum(len(ch["videos"]) for ch in all_data)
-    print(f"\n총 {len(all_data)}개 채널, {total}개 동영상 수집 완료\n")
+    print(f"\n총 {len(all_data)}개 채널, {total}개 동영상 수집 완료")
+
+    raw_path = save_raw_data(all_data)
+    print(f"원본 데이터 저장: {raw_path}\n")
 
     print("=" * 60)
     video_summary = build_video_summary(all_data)
@@ -253,7 +313,8 @@ def main():
     report_path = save_report(report, today_str)
     print(f"\n리포트 저장 완료: {report_path}")
 
-    send_email(report, today_str)
+    if not args.no_email:
+        send_email(report, today_str)
 
 
 if __name__ == "__main__":
